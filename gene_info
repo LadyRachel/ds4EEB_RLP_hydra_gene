@@ -1,0 +1,149 @@
+## ============================================================
+## Reproducible R script: Hydra AEP gene feature table
+## Data source: Hydra vulgaris AEP genome (Cazet et al. 2022)
+##   GFF3 : https://research.nhgri.nih.gov/HydraAEP/download/
+## ============================================================
+
+## ── 0. Install / load packages ────────────────────────────────
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+pkgs_bioc <- c("rtracklayer", "GenomicRanges", "GenomeInfoDb")
+pkgs_cran <- c("dplyr", "readr", "stringr", "data.table")
+
+for (p in pkgs_bioc) {
+  if (!requireNamespace(p, quietly = TRUE)) BiocManager::install(p)
+}
+for (p in pkgs_cran) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+}
+
+library(rtracklayer)
+library(GenomicRanges)
+library(dplyr)
+library(stringr)
+library(data.table)
+
+## ── 1. Download files (cached locally) ────────────────────────
+# Hydra AEP v1.0 – Cazet et al. 2022 (NIH NHGRI server)
+gff_url   <- "https://research.nhgri.nih.gov/HydraAEP/download/annotation/aep.v2.gff3.gz"
+fai_url   <- "https://research.nhgri.nih.gov/HydraAEP/download/genome/aep.genome.fa.fai"
+
+gff_file  <- "aep_v2.gff3.gz"
+fai_file  <- "aep_genome.fa.fai"
+
+if (!file.exists(gff_file))
+  download.file(gff_url, gff_file, mode = "wb")
+
+if (!file.exists(fai_file))
+  download.file(fai_url, fai_file, mode = "wb")
+
+## ── 2. Load scaffold / chromosome lengths from FASTA index ─────
+fai <- read.table(fai_file, header = FALSE, sep = "\t",
+                  col.names = c("chr", "length", "offset", "bases", "bytes"))
+chr_lengths <- setNames(fai$length, fai$chr)
+
+## ── 3. Parse GFF3 – keep gene-level features only ──────────────
+cat("Importing GFF3 (this may take a moment)...\n")
+gff_all <- import(gff_file)                        # import full GFF3
+genes   <- gff_all[gff_all$type == "gene"]         # gene rows only
+
+## ── 4. Build base table ────────────────────────────────────────
+gene_df <- as.data.frame(genes) %>%
+  transmute(
+    gene_name          = ifelse(!is.na(Name), Name,
+                                ifelse(!is.na(ID), ID, as.character(seq_len(n())))),
+    scaffold_chr       = as.character(seqnames),
+    start              = start,
+    end                = end,
+    strand             = as.character(strand),
+    gene_length        = width,                        # end - start + 1
+    scaffold_chr_length = chr_lengths[scaffold_chr]
+  )
+
+## ── 5. Flag duplicate gene names ──────────────────────────────
+gene_df <- gene_df %>%
+  group_by(gene_name) %>%
+  mutate(
+    is_duplicate = n() > 1,
+    dup_type     = case_when(
+      n() == 1                     ~ "unique",
+      n() > 1 & duplicated(gene_name, fromLast = FALSE) ~ "duplicate_secondary",
+      TRUE                         ~ "duplicate_primary"
+    )
+  ) %>%
+  ungroup()
+
+## ── 6. Flag opsins ─────────────────────────────────────────────
+# Opsin gene names in Hydra AEP typically contain "opsin" or "ops"
+# OR carry a known opsin annotation; here we use a name-based heuristic.
+opsin_pattern <- regex("opsin|\\bops\\b|rhodopsin", ignore_case = TRUE)
+
+gene_df <- gene_df %>%
+  mutate(is_opsin = str_detect(gene_name, opsin_pattern))
+
+# If the GFF carries a 'product' or 'Note' attribute with opsin info, also check:
+if ("product" %in% names(mcols(genes))) {
+  product_vec <- as.character(mcols(genes)$product)
+  gene_df$is_opsin <- gene_df$is_opsin |
+    str_detect(replace_na(product_vec, ""), opsin_pattern)
+}
+if ("Note" %in% names(mcols(genes))) {
+  note_vec <- as.character(mcols(genes)$Note)
+  gene_df$is_opsin <- gene_df$is_opsin |
+    str_detect(replace_na(note_vec, ""), opsin_pattern)
+}
+
+## ── 7. Distance to nearest neighbouring gene ──────────────────
+# Uses GenomicRanges::distanceToNearest (ignores self)
+gr_genes <- GRanges(
+  seqnames = gene_df$scaffold_chr,
+  ranges   = IRanges(start = gene_df$start, end = gene_df$end),
+  strand   = gene_df$strand
+)
+
+# distanceToNearest returns distance to nearest *other* range
+hits   <- distanceToNearest(gr_genes, ignore.strand = FALSE)
+# Build a vector; genes with no neighbour get NA
+dist_vec <- rep(NA_integer_, nrow(gene_df))
+dist_vec[queryHits(hits)] <- mcols(hits)$distance
+
+gene_df$dist_near_gene <- dist_vec
+
+## ── 8. Gene density (genes per 100 kb window on same scaffold) ─
+# Defined as: number of genes whose midpoint falls within ±50 kb
+# of the focal gene's midpoint, on the same scaffold.
+WINDOW_HALF <- 50000L   # 100 kb window centred on each gene
+
+setDT(gene_df)
+gene_df[, midpoint := as.integer((start + end) / 2)]
+
+gene_density_vec <- vapply(seq_len(nrow(gene_df)), function(i) {
+  scaf  <- gene_df$scaffold_chr[i]
+  mid_i <- gene_df$midpoint[i]
+  # count genes on same scaffold within window (excluding self)
+  sum(gene_df$scaffold_chr == scaf &
+        gene_df$midpoint   >= mid_i - WINDOW_HALF &
+        gene_df$midpoint   <= mid_i + WINDOW_HALF) - 1L
+}, integer(1))
+
+gene_df[, gene_density := gene_density_vec]
+gene_df[, midpoint := NULL]   # drop helper column
+
+## ── 9. Final column order ──────────────────────────────────────
+setDF(gene_df)
+gene_table <- gene_df %>%
+  select(gene_name, start, end, strand, gene_length,
+         scaffold_chr_length, is_duplicate, dup_type,
+         is_opsin, dist_near_gene, gene_density)
+
+## ── 10. Preview & save ─────────────────────────────────────────
+cat("\nDimensions:", nrow(gene_table), "genes x", ncol(gene_table), "columns\n")
+print(head(gene_table, 10))
+
+write.csv(gene_table, "hydra_aep_gene_table.csv", row.names = FALSE)
+cat("\nSaved: hydra_aep_gene_table.csv\n")
+
+# Optional: save as RDS for fast R re-loading
+saveRDS(gene_table, "hydra_aep_gene_table.rds")
+cat("Saved: hydra_aep_gene_table.rds\n")
