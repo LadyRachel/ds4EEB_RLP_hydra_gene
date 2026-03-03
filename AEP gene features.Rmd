@@ -1,0 +1,47 @@
+---
+title: "AEP gene features"
+author: "Rachel Parsons"
+date: "2026-03-02"
+output: html_document
+---
+
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+pkgs_bioc <- c("rtracklayer", "GenomicRanges", "GenomeInfoDb", "Biostrings")
+pkgs_cran <- c("dplyr", "readr", "stringr", "data.table")
+
+for (p in pkgs_bioc) {
+  if (!requireNamespace(p, quietly = TRUE)) BiocManager::install(p)
+}
+for (p in pkgs_cran) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+}
+
+library(rtracklayer)
+library(GenomicRanges)
+library(dplyr)
+library(stringr)
+library(data.table)
+library(R.utils)
+library(Biostrings)
+```
+```{r}
+# Define paths
+full_assembly_fasta <- "https://research.nhgri.nih.gov/HydraAEP/download/sequences/hv_aep/HVAEP.genome.fa.gz"
+fasta_file <- "HVAEP.genome.fa.gz"
+
+# Download only if not already present
+if (!file.exists(fasta_file)) {
+  download.file(full_assembly_fasta, destfile = fasta_file, mode = "wb")
+}
+```
+```{r}
+aep_fasta_zip<-gunzip("HVAEP.genome.fa.gz")
+```
+
+```{r}
+aep_fasta<-readDNAStringSet("HVAEP.genome.fa")
+```
+

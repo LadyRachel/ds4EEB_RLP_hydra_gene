@@ -26,7 +26,7 @@ library(data.table)
 
 ## ── 1. Download files (cached locally) ────────────────────────
 # Hydra AEP v1.0 – Cazet et al. 2022 (NIH NHGRI server)
-gff_url   <- "https://research.nhgri.nih.gov/HydraAEP/download/annotation/aep.v2.gff3.gz"
+gff_url   <- "https://research.nhgri.nih.gov/HydraAEP/download/coordinates/hv_aep/HVAEP.GeneModels.gff3.gz"
 fai_url   <- "https://research.nhgri.nih.gov/HydraAEP/download/genome/aep.genome.fa.fai"
 
 gff_file  <- "aep_v2.gff3.gz"
