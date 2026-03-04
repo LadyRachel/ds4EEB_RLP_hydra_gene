@@ -18,6 +18,10 @@ for (p in pkgs_bioc) {
 for (p in pkgs_cran) {
   if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
 }
+#install.packages("readr") # Install if not already installed
+library(readr)
+library(tidyr)
+library(broom)
 
 library(rtracklayer)
 library(GenomicRanges)
@@ -29,19 +33,360 @@ library(Biostrings)
 ```
 ```{r}
 # Define paths
-full_assembly_fasta <- "https://research.nhgri.nih.gov/HydraAEP/download/sequences/hv_aep/HVAEP.genome.fa.gz"
-fasta_file <- "HVAEP.genome.fa.gz"
+#full_assembly_fasta <- "https://research.nhgri.nih.gov/HydraAEP/download/sequences/hv_aep/HVAEP.genome.fa.gz"
+#fasta_file <- "HVAEP.genome.fa.gz"
 
 # Download only if not already present
-if (!file.exists(fasta_file)) {
-  download.file(full_assembly_fasta, destfile = fasta_file, mode = "wb")
-}
+#if (!file.exists(fasta_file)) {
+#  download.file(full_assembly_fasta, destfile = fasta_file, mode = "wb")
+#}
 ```
 ```{r}
-aep_fasta_zip<-gunzip("HVAEP.genome.fa.gz")
+FASTA_URL  <- "https://research.nhgri.nih.gov/HydraAEP/download/sequences/hv_aep/HVAEP.genome.fa.gz"
+FASTA_GZ   <- "HVAEP.genome.fa.gz"
+FASTA_FILE <- "HVAEP.genome.fa"
+
+if (!file.exists(FASTA_GZ) && !file.exists(FASTA_FILE)) {
+  cat("Downloading FASTA...\n")
+  download.file(FASTA_URL, FASTA_GZ, mode = "wb")
+}
+
+if (!file.exists(FASTA_FILE)) {
+  cat("Decompressing FASTA...\n")
+  R.utils::gunzip(FASTA_GZ, destname = FASTA_FILE, remove = FALSE)
+  cat("Done.\n\n")
+} else {
+  cat("FASTA already decompressed – skipping gunzip.\n\n")
+}
 ```
+
 
 ```{r}
 aep_fasta<-readDNAStringSet("HVAEP.genome.fa")
 ```
+
+```{r}
+
+GFF3_URL <- "https://research.nhgri.nih.gov/HydraAEP/download/coordinates/hv_aep/HVAEP.GeneModels.gff3.gz"
+GFF3_FILE <- "HVAEP.GeneModels.gff3.gz"
+
+if (!file.exists(GFF3_FILE)) {
+  cat("Downloading AEP GFF3 from NHGRI portal...\n")
+  tryCatch(
+    download.file(GFF3_URL, GFF3_FILE, mode = "wb"),
+    error = function(e) stop(
+      "\nDownload failed. Please download manually:\n",
+      "  URL: ", GFF3_URL, "\n",
+      "  Save as: ", GFF3_FILE, "\n",
+      "  in your R working directory (", getwd(), ")\n"
+    )
+  )
+  cat("Download complete.\n\n")
+} else {
+  cat("GFF3 file found locally – skipping download.\n\n")
+}
+
+```
+```{r}
+## ── 2. Parse GFF3 ─────────────────────────────────────────────
+cat("Importing GFF3...\n")
+gff_all <- import(GFF3_FILE)
+
+```
+```{r}
+## The NHGRI AEP GFF3 uses type "gene" for gene-level features.
+## Check what types are present if the gene count looks wrong.
+cat("Feature types in GFF3:\n")
+print(table(gff_all$type))
+
+genes <- gff_all[gff_all$type == "gene"]
+cat("\nGene records:", length(genes), "\n")
+
+## Sanity check – expect ~28,917
+if (length(genes) == 0) {
+  # Some custom GFF3s use "mRNA" as the top-level feature instead of "gene"
+  cat("No 'gene' features found – trying 'mRNA' as top-level feature...\n")
+  genes <- gff_all[gff_all$type == "mRNA"]
+  # Deduplicate by locus (keep widest range per ID)
+  cat("mRNA records:", length(genes), "\n")
+}
+```
+
+```{r}
+## ── 3. Scaffold lengths ───────────────────────────────────────
+## Strategy 1: parse ##sequence-region pragma lines from GFF3 header
+## Strategy 2: derive from the max end coordinate per scaffold in the GFF3
+## (The NHGRI custom GFF3 may not include ##sequence-region lines, so we
+##  use strategy 2 as a robust fallback.)
+
+cat("\nExtracting scaffold lengths from GFF3 header lines...\n")
+con <- gzcon(file(GFF3_FILE, "rb"))
+hdr_lines <- character(0)
+repeat {
+  ln <- readLines(con, n = 1, warn = FALSE)
+  if (length(ln) == 0 || !startsWith(ln, "#")) break
+  hdr_lines <- c(hdr_lines, ln)
+}
+close(con)
+
+seq_rgn <- grep("^##sequence-region", hdr_lines, value = TRUE)
+
+if (length(seq_rgn) > 0) {
+  parts       <- strsplit(trimws(seq_rgn), "\\s+")
+  chr_lengths <- setNames(
+    as.integer(sapply(parts, `[`, 4)),
+    sapply(parts, `[`, 2)
+  )
+  cat("Found", length(chr_lengths),
+      "scaffold lengths from ##sequence-region headers.\n")
+} else {
+  cat("No ##sequence-region headers found.\n",
+      "Deriving scaffold lengths from max(end) per scaffold in GFF3...\n")
+  # Use ALL features (not just genes) for most accurate scaffold extent
+  all_df <- as.data.frame(gff_all)
+  scaf_max <- all_df %>%
+    group_by(seqnames) %>%
+    summarise(max_end = max(end), .groups = "drop")
+  chr_lengths <- setNames(scaf_max$max_end,
+                          as.character(scaf_max$seqnames))
+  cat("Derived lengths for", length(chr_lengths), "scaffolds.\n")
+}
+```
+```{r}
+## ── 4. Helper: safe GFF attribute extractor ───────────────────
+get_attr <- function(gr, field) {
+  if (field %in% names(mcols(gr)))
+    as.character(mcols(gr)[[field]])
+  else
+    rep(NA_character_, length(gr))
+}
+```
+
+```{r}
+## ── 5. Gene name ──────────────────────────────────────────────
+## AEP gene IDs follow the pattern: HVAEP<scaffold>.G<num>
+## The GFF3 stores this in the 'ID' attribute; 'Name' may also be present.
+gene_name_vec <- get_attr(genes, "Name")
+gene_name_vec <- ifelse(is.na(gene_name_vec),
+                        get_attr(genes, "ID"), gene_name_vec)
+
+scaff_names <- as.character(seqnames(genes))
+
+```
+
+```{r}
+## ── 6. Base table ─────────────────────────────────────────────
+gene_df <- tibble(
+  gene_name           = gene_name_vec,
+  scaffold_chr        = scaff_names,
+  start               = start(genes),
+  end                 = end(genes),
+  strand              = as.character(strand(genes)),
+  gene_length         = width(genes),
+  scaffold_chr_length = chr_lengths[scaff_names]
+)
+
+cat("\nPreview of gene names (first 6):\n")
+print(head(gene_df$gene_name))
+```
+##scaffold level gene density
+```{r}
+scaffold_density <- gene_df %>%
+  group_by(scaffold_chr) %>%
+  summarise(
+    n_genes        = n(),
+    scaffold_length = first(scaffold_chr_length),
+    gene_density_per_mb = n_genes / (scaffold_length / 1e6),
+    .groups = "drop"
+  )
+
+gene_df <- gene_df %>%
+  left_join(scaffold_density %>% select(scaffold_chr, gene_density_per_mb, n_genes),
+            by = "scaffold_chr")
+```
+
+##Distance to nearest gene
+```{r}
+gene_gr <- makeGRangesFromDataFrame(
+  gene_df,
+  seqnames.field  = "scaffold_chr",
+  start.field     = "start",
+  end.field       = "end",
+  strand.field    = "strand",
+  keep.extra.columns = TRUE
+)
+# For each gene, distance to its nearest *other* gene
+dist_hits  <- distanceToNearest(gene_gr, ignore.strand = TRUE)
+gene_df$dist_to_nearest_gene_bp <- NA_real_
+gene_df$dist_to_nearest_gene_bp[queryHits(dist_hits)] <- mcols(dist_hits)$distance
+```
+
+
+##Read in Opsin IDs
+```{r}
+opsin_ids_raw <- readLines("AEP.txt")
+head(opsin_ids_raw)  # check format before stripping
+opsin_ids_stripped <- opsin_ids_raw
+```
+```{r}
+gene_df <- gene_df %>%
+  mutate(is_opsin = gene_name %in% opsin_ids_stripped)
+
+cat("Opsin genes flagged:", sum(gene_df$is_opsin), "\n")
+```
+```{r}
+dup_pairs <- read_tsv("dup_pairsAEP.tsv", col_types = cols()) %>%
+  rename(dup1 = 1, dup2 = 2, dup_type = 3) %>%
+  filter(!is.na(dup_type), dup_type != "type")
+
+cat("Pairs loaded:", nrow(dup_pairs), "\n")
+print(count(dup_pairs, dup_type))
+```
+
+
+```{r}
+pair_features_full <- dup_pairs %>%
+  mutate(
+    dup1_key = str_replace(dup1, "^AEP_", ""),
+    dup2_key = str_replace(dup2, "^AEP_", "")
+  ) %>%
+  left_join(gene_df %>% select(gene_name, gene_length, dist_to_nearest_gene_bp,
+                                gene_density_per_mb, scaffold_chr_length, is_opsin),
+            by = c("dup1_key" = "gene_name")) %>%
+  rename_with(~paste0(.x, "_dup1"), c(gene_length, dist_to_nearest_gene_bp,
+                                       gene_density_per_mb, scaffold_chr_length, is_opsin)) %>%
+  left_join(gene_df %>% select(gene_name, gene_length, dist_to_nearest_gene_bp,
+                                gene_density_per_mb, scaffold_chr_length, is_opsin),
+            by = c("dup2_key" = "gene_name")) %>%
+  rename_with(~paste0(.x, "_dup2"), c(gene_length, dist_to_nearest_gene_bp,
+                                       gene_density_per_mb, scaffold_chr_length, is_opsin)) %>%
+  mutate(
+    mean_gene_density = (gene_density_per_mb_dup1 + gene_density_per_mb_dup2) / 2,
+    mean_gene_length  = (gene_length_dup1 + gene_length_dup2) / 2,
+    mean_dist_to_gene = (dist_to_nearest_gene_bp_dup1 + dist_to_nearest_gene_bp_dup2) / 2,
+    either_opsin      = is_opsin_dup1 | is_opsin_dup2,
+    dup_type          = factor(dup_type, levels = c("TD","PD","SD","DD"))
+  )
+
+# Quick sanity check
+glimpse(pair_features_full)
+cat("Rows with any NA in key features:", sum(!complete.cases(
+  pair_features_full %>% select(mean_gene_density, mean_gene_length, mean_dist_to_gene)
+)), "\n")
+cat("Pairs involving at least one opsin:", sum(pair_features_full$either_opsin, na.rm=TRUE), "\n")
+
+```
+
+```{r}
+model_data <- pair_features_full %>%
+  filter(dup_type %in% c("TD", "DD")) %>%
+  mutate(y = as.integer(dup_type == "TD")) %>%
+  select(y, mean_dist_to_gene, mean_gene_density, mean_gene_length,
+         scaffold_chr_length_dup1, either_opsin) %>%
+  drop_na()
+
+# Scale numeric predictors
+num_cols <- c("mean_dist_to_gene", "mean_gene_density", "mean_gene_length", "scaffold_chr_length_dup1")
+model_data[num_cols] <- scale(model_data[num_cols])
+
+cat("Model dataset: n =", nrow(model_data),
+    " | TD =", sum(model_data$y),
+    " | DD =", sum(model_data$y == 0), "\n")
+cat("Opsin pairs in model:", sum(model_data$either_opsin), "\n")
+
+full_model <- glm(y ~ mean_dist_to_gene + mean_gene_density + mean_gene_length +
+                      scaffold_chr_length_dup1 + either_opsin,
+                  data   = model_data,
+                  family = binomial(link = "logit"))
+
+summary(full_model)
+tidy(full_model, exponentiate = TRUE, conf.int = TRUE)
+```
+
+
+```{r}
+# Window size in bp — 500kb is a reasonable start for Hydra
+WINDOW <- 500000
+
+# For each gene, count how many other genes fall within ± WINDOW bp
+gene_gr_windows <- resize(gene_gr,
+                           width = 2 * WINDOW + width(gene_gr),
+                           fix   = "center")
+
+# Count overlaps: how many genes does each window contain?
+# subtract 1 to exclude the gene itself
+hits <- countOverlaps(gene_gr_windows, gene_gr, ignore.strand = TRUE) - 1
+
+# Add to gene_df
+gene_df <- gene_df %>%
+  mutate(
+    local_gene_density = hits / (2 * WINDOW / 1e6)  # genes per Mb in window
+  )
+
+# Quick sanity check
+summary(gene_df$local_gene_density)
+```
+```{r}
+# Step 1: check what density columns actually exist now
+colnames(pair_features_full)
+```
+```{r}
+# Step 2: re-join local density
+pair_features_full <- pair_features_full %>%
+  select(-any_of(c("mean_gene_density", "gene_density_per_mb_dup1", 
+                    "gene_density_per_mb_dup2", "local_density_dup1",
+                    "local_density_dup2", "mean_local_density"))) %>%
+  left_join(gene_df %>% select(gene_name, local_gene_density),
+            by = c("dup1_key" = "gene_name")) %>%
+  rename(local_density_dup1 = local_gene_density) %>%
+  left_join(gene_df %>% select(gene_name, local_gene_density),
+            by = c("dup2_key" = "gene_name")) %>%
+  rename(local_density_dup2 = local_gene_density) %>%
+  mutate(mean_local_density = (local_density_dup1 + local_density_dup2) / 2)
+
+# Step 3: rebuild model_data with the new column
+model_data <- pair_features_full %>%
+  filter(dup_type %in% c("TD", "DD")) %>%
+  mutate(y = as.integer(dup_type == "TD")) %>%
+  select(y, mean_dist_to_gene, mean_local_density, mean_gene_length,
+         scaffold_chr_length_dup1, either_opsin) %>%
+  drop_na()
+
+num_cols <- c("mean_dist_to_gene", "mean_local_density", 
+              "mean_gene_length", "scaffold_chr_length_dup1")
+model_data[num_cols] <- scale(model_data[num_cols])
+
+# Step 4: now run the model
+full_model <- glm(y ~ mean_dist_to_gene + mean_local_density + mean_gene_length +
+                      scaffold_chr_length_dup1 + either_opsin,
+                  data   = model_data,
+                  family = binomial(link = "logit"))
+
+summary(full_model)
+tidy(full_model, exponentiate = TRUE, conf.int = TRUE)
+```
+
+
+
+
+```{r}
+# Re-join with updated gene_df
+pair_features_full <- pair_features_full %>%
+  select(-mean_gene_density, -gene_density_per_mb_dup1, -gene_density_per_mb_dup2) %>%
+  left_join(gene_df %>% select(gene_name, local_gene_density),
+            by = c("dup1_key" = "gene_name")) %>%
+  rename(local_density_dup1 = local_gene_density) %>%
+  left_join(gene_df %>% select(gene_name, local_gene_density),
+            by = c("dup2_key" = "gene_name")) %>%
+  rename(local_density_dup2 = local_gene_density) %>%
+  mutate(mean_local_density = (local_density_dup1 + local_density_dup2) / 2)
+```
+
+```{r}
+full_model <- glm(y ~ mean_dist_to_gene + mean_local_density + mean_gene_length +
+                      scaffold_chr_length_dup1 + either_opsin,
+                  data   = model_data,
+                  family = binomial(link = "logit"))
+```
+
 

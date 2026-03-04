@@ -1,0 +1,166 @@
+---
+title: "AEP Bayesian"
+output: html_document
+date: "2026-03-04"
+---
+
+```{r}
+library(rstanarm)
+library(bayesplot)
+library(tidybayes)
+
+# ── FIT BAYESIAN MODEL ────────────────────────────────────────────────────────
+# Weakly informative priors (default in rstanarm — appropriate here)
+# This will take 2-5 minutes to sample 4 chains × 2000 iterations
+
+cat("Fitting Bayesian logistic regression...\n")
+
+bayes_model <- stan_glm(
+  y ~ mean_dist_to_gene + mean_local_density + mean_gene_length +
+      scaffold_chr_length_dup1 + either_opsin,
+  data   = model_data,
+  family = binomial(link = "logit"),
+  prior  = normal(0, 2.5),          # weakly informative
+  prior_intercept = normal(0, 10),
+  chains = 4,
+  iter   = 2000,                     # 1000 warmup + 1000 sampling per chain
+  seed   = 42,
+  cores  = parallel::detectCores()   # sample chains in parallel
+)
+
+cat("Done sampling.\n")
+summary(bayes_model)
+```
+
+
+
+```{r}
+# ── BAYESIAN PLOTS ────────────────────────────────────────────────────────────
+posterior <- as.matrix(bayes_model)
+param_names <- c("mean_dist_to_gene", "mean_local_density", "mean_gene_length",
+                 "scaffold_chr_length_dup1", "either_opsinopsin")
+param_labels <- c("Distance to nearest gene", "Local gene density",
+                  "Gene length", "Scaffold size", "Either gene is opsin")
+
+# ── PLOT 1: Traceplots ─────────────────────────────────────────────────────────
+p_trace <- mcmc_trace(
+  as.array(bayes_model),
+  pars = param_names,
+  facet_args = list(labeller = labeller(parameter = setNames(param_labels, param_names)),
+                    ncol = 1)
+) +
+  scale_color_manual(values = c("#ff6b6b","#4ecdc4","#ffe66d","#58a6ff")) +
+  labs(title    = "MCMC Traceplots",
+       subtitle = "Healthy chains show random mixing ('hairy caterpillar') with no trends or divergences") +
+  theme_hydra +
+  theme(strip.text = element_text(color = "#c9d1d9", size = 8))
+
+# ── PLOT 2: Posterior Distributions ───────────────────────────────────────────
+p_posterior <- mcmc_areas(
+  posterior,
+  pars = param_names,
+  prob = 0.89,          # 89% credible interval (common Bayesian choice)
+  prob_outer = 0.95
+) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "#ffe66d", linewidth = 0.8) +
+  scale_y_discrete(labels = rev(param_labels)) +
+  labs(title    = "Posterior Distributions (log-odds scale)",
+       subtitle = "Shaded = 89% credible interval; dashed line = zero effect") +
+  theme_hydra
+
+# ── PLOT 3: Credible Intervals vs Frequentist CIs ─────────────────────────────
+# Extract posterior credible intervals
+bayes_ci <- as_tibble(posterior[, param_names]) %>%
+  pivot_longer(everything(), names_to = "term", values_to = "sample") %>%
+  group_by(term) %>%
+  summarise(
+    mean   = mean(sample),
+    lo89   = quantile(sample, 0.055),
+    hi89   = quantile(sample, 0.945),
+    lo95   = quantile(sample, 0.025),
+    hi95   = quantile(sample, 0.975),
+    p_dir  = mean(sample > 0),   # probability of direction
+    .groups = "drop"
+  ) %>%
+  mutate(
+    term_clean = recode(term, !!!setNames(param_labels, param_names)),
+    method = "Bayesian"
+  )
+
+freq_ci <- tidy(full_model, conf.int = TRUE) %>%
+  filter(term %in% param_names) %>%
+  mutate(
+    term_clean = recode(term, !!!setNames(param_labels, param_names)),
+    lo95 = conf.low, hi95 = conf.high, mean = estimate, method = "Frequentist"
+  ) %>%
+  select(term, term_clean, mean, lo95, hi95, method)
+
+p_compare <- ggplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#6e7681") +
+  # Frequentist 95% CI
+  geom_errorbar(data = freq_ci,
+                aes(x = term_clean, ymin = lo95, ymax = hi95, color = method),
+                width = 0.15, linewidth = 1.2, position = position_nudge(x = 0.15)) +
+  geom_point(data = freq_ci,
+             aes(x = term_clean, y = mean, color = method),
+             size = 3.5, position = position_nudge(x = 0.15)) +
+  # Bayesian 95% CI
+  geom_errorbar(data = bayes_ci,
+                aes(x = term_clean, ymin = lo95, ymax = hi95, color = method),
+                width = 0.15, linewidth = 1.2, position = position_nudge(x = -0.15)) +
+  geom_point(data = bayes_ci,
+             aes(x = term_clean, y = mean, color = method),
+             size = 3.5, position = position_nudge(x = -0.15)) +
+  scale_color_manual(values = c("Bayesian" = "#ff6b6b", "Frequentist" = "#4ecdc4"),
+                     name = NULL) +
+  coord_flip() +
+  labs(title    = "Bayesian vs Frequentist Coefficient Estimates",
+       subtitle = "Points = mean/estimate; bars = 95% CI / credible interval",
+       x = NULL, y = "Coefficient (log-odds)") +
+  theme_hydra +
+  theme(legend.position = "top")
+
+# ── PLOT 4: Posterior Predictive Check ────────────────────────────────────────
+p_ppc <- pp_check(bayes_model, nreps = 100, plotfun = "stat",
+                  stat = "mean") +
+  labs(title    = "Posterior Predictive Check",
+       subtitle = "Simulated outcome means (light) vs observed mean (dark)\nGood fit = observed falls within simulated distribution") +
+  scale_color_manual(values = c("#4ecdc4", "#ff6b6b")) +
+  scale_fill_manual(values  = c("#4ecdc4", "#ff6b6b")) +
+  theme_hydra
+
+# ── PLOT 5: Opsin Posterior in Detail ─────────────────────────────────────────
+opsin_samples <- tibble(sample = posterior[, "either_opsinopsin"])
+p_opsin_post <- ggplot(opsin_samples, aes(x = sample)) +
+  geom_histogram(aes(fill = after_stat(x) > 0),
+                 bins = 80, color = NA, alpha = 0.85) +
+  geom_vline(xintercept = 0, linetype = "dashed",
+             color = "#ffe66d", linewidth = 1) +
+  geom_vline(xintercept = mean(opsin_samples$sample),
+             color = "#ff6b6b", linewidth = 1.2) +
+  annotate("text",
+           x    = mean(opsin_samples$sample) + 0.05,
+           y    = Inf, vjust = 2, hjust = 0,
+           label = sprintf("Mean = %.2f\nP(β > 0) = %.1f%%",
+                           mean(opsin_samples$sample),
+                           mean(opsin_samples$sample > 0) * 100),
+           color = "#ff6b6b", size = 3.8) +
+  scale_fill_manual(values = c("FALSE" = "#4ecdc4", "TRUE" = "#ff6b6b"),
+                    labels = c("FALSE" = "Negative (non-TD)", "TRUE" = "Positive (TD)"),
+                    name   = "Effect direction") +
+  labs(title    = "Posterior Distribution: Opsin Effect",
+       subtitle = "What fraction of posterior mass falls above zero?",
+       x = "β (log-odds of TD | opsin gene)", y = "Count") +
+  theme_hydra
+
+# ── SAVE ──────────────────────────────────────────────────────────────────────
+ggsave("bayes_traceplots.png",     p_trace,      width = 10, height = 12, dpi = 200, bg = "#0d1117")
+ggsave("bayes_posteriors.png",     p_posterior,  width = 8,  height = 6,  dpi = 200, bg = "#0d1117")
+ggsave("bayes_vs_freq.png",        p_compare,    width = 9,  height = 6,  dpi = 200, bg = "#0d1117")
+ggsave("bayes_ppc.png",            p_ppc,        width = 7,  height = 5,  dpi = 200, bg = "#0d1117")
+ggsave("bayes_opsin_posterior.png",p_opsin_post, width = 8,  height = 5,  dpi = 200, bg = "#0d1117")
+
+cat("All Bayesian plots saved.\n")
+```
+
+
