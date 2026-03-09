@@ -1,0 +1,343 @@
+---
+title: "Modelling"
+format: html
+editor: visual
+---
+
+## Hydra vulgaris AEP — Pair Features & Logistic Model
+
+
+```{r}
+#always load libraries
+library(dplyr)
+library(readr)
+library(stringr)
+library(tibble)
+library(tidyr)
+library(broom)
+library(pROC)
+library(ggeffects)
+library(brms)
+```
+
+###Load from previous script and make sure dup_type still in enviornment
+```{r}
+gene_table <- readRDS("hydra_aep_gene_table.rds")
+nrow(dup_pairs)
+print(count(dup_pairs, dup_type))
+```
+### Seperate to work with each dup pair
+```{r}
+gene_feats <- gene_table %>%
+  dplyr::select(
+    gene_name,
+    gene_length,
+    dist_near_gene,
+    local_gene_density,
+    scaffold_chr_length,
+    is_opsin
+  )
+
+gene_feats_dup1 <- gene_feats %>%
+  dplyr::rename(
+    dup1 = gene_name,
+    gene_length_dup1 = gene_length,
+    dist_near_gene_dup1 = dist_near_gene,
+    local_gene_density_dup1 = local_gene_density,
+    scaffold_chr_length_dup1 = scaffold_chr_length,
+    is_opsin_dup1 = is_opsin
+  )
+
+gene_feats_dup2 <- gene_feats %>%
+  dplyr::rename(
+    dup2 = gene_name,
+    gene_length_dup2 = gene_length,
+    dist_near_gene_dup2 = dist_near_gene,
+    local_gene_density_dup2 = local_gene_density,
+    scaffold_chr_length_dup2 = scaffold_chr_length,
+    is_opsin_dup2 = is_opsin
+  )
+```
+
+###One table
+```{r}
+pair_features_full <- dup_pairs %>%
+  dplyr::left_join(gene_feats_dup1, by = "dup1") %>%
+  dplyr::left_join(gene_feats_dup2, by = "dup2") %>%
+  dplyr::mutate(
+    mean_gene_length    = (gene_length_dup1 + gene_length_dup2) / 2,
+    mean_dist_to_gene   = (dist_near_gene_dup1 + dist_near_gene_dup2) / 2,
+    mean_local_density  = (local_gene_density_dup1 + local_gene_density_dup2) / 2,
+    scaffold_chr_length = scaffold_chr_length_dup1,
+    either_opsin        = is_opsin_dup1 | is_opsin_dup2
+  )
+```
+
+```{r}
+ nrow(pair_features_full)
+ncol(pair_features_full)
+```
+
+```{r}
+sum(pair_features_full$either_opsin, na.rm = TRUE)
+```
+```{r}
+write_tsv(pair_features_full, "pair_feature_table_AEP.tsv")
+```
+
+### Modelling time
+```{r}
+model_data <- pair_features_full %>%
+  filter(dup_type %in% c("TD", "DD")) %>%
+  mutate(y = as.integer(dup_type == "TD")) %>%
+  dplyr::select(
+    y,
+    mean_dist_to_gene,
+    mean_local_density,
+    mean_gene_length,
+    scaffold_chr_length_dup1,
+    either_opsin
+  ) %>%
+  drop_na()
+```
+
+```{r}
+num_cols <- c("mean_dist_to_gene", "mean_local_density",
+              "mean_gene_length",  "scaffold_chr_length_dup1")
+model_data[num_cols] <- scale(model_data[num_cols])
+```
+
+```{r}
+nrow(model_data)
+sum(model_data$either_opsin)
+```
+
+```{r}
+bayes_model <- brm(
+  y ~ mean_dist_to_gene + mean_local_density + mean_gene_length +
+    scaffold_chr_length_dup1 + either_opsin,
+  data   = model_data,
+  family = bernoulli(link = "logit"),  # bernoulli = binary logistic
+  prior  = c(
+    prior(normal(0, 2.5), class = b),           # all slope priors
+    prior(normal(0, 10),  class = Intercept)    # intercept prior
+  ),
+  chains = 4,
+  iter   = 2000,
+  seed   = 42
+)
+```
+
+```{r}
+print(summary(bayes_model))
+```
+```{r}
+saveRDS(bayes_model, "bayes_model.rds")
+```
+
+```{r}
+posterior <- as_draws_matrix(bayes_model)
+```
+
+```{r}
+opsin_col <- grep("b_either_opsin", colnames(posterior), value = TRUE)
+
+if (length(opsin_col) == 0) {
+  stop(
+    "Cannot find either_opsin column in posterior draws.\n",
+    "Available columns: ",
+    paste(colnames(posterior), collapse = ", ")
+  )
+}
+
+opsin_samples <- posterior[, opsin_col[1]]
+
+```
+
+
+
+### What you need for images
+```{r}
+saveRDS(model_data,         "model_data.rds")
+saveRDS(pair_features_full, "pair_features_full.rds")
+```
+
+
+```{r}
+DUP_COLORS <- c(TD = "#ff6b6b", PD = "#ffe66d",
+                SD = "#c77dff", DD = "#4ecdc4")
+
+```
+
+
+```{r}
+type_counts <- pair_features_full %>%
+  count(dup_type) %>%
+  mutate(pct = n / sum(n) * 100)
+print(type_counts)
+```
+
+```{r}
+p_counts <- ggplot(type_counts,
+                   aes(x = dup_type, y = n, fill = dup_type)) +
+  geom_col(color = "#0d1117", linewidth = 0.8) +
+  geom_text(aes(label = paste0(comma(n), "\n(", round(pct, 1), "%)")),
+            vjust = -0.3, size = 3.2,
+            fontface = "bold") +
+  scale_fill_manual(values = DUP_COLORS, guide = "none") +
+  scale_y_continuous(labels = comma,
+                     expand = expansion(mult = c(0, 0.18))) +
+  labs(
+    title    = "Duplicate Pair Counts by Type",
+    subtitle = paste("AEP genome | n =",
+                     comma(nrow(pair_features_full)), "pairs"),
+    x = NULL, y = "Number of pairs",
+    caption  = "doubletrouble standard scheme (Almeida-Silva & Van de Peer 2025)"
+  )
+p_counts
+```
+
+
+```{r}
+ggsave("eda_type_counts.png", p_counts,
+       width = 6, height = 5, dpi = 200)
+```
+
+```{r}
+long_feats <- pair_features_full %>%
+  dplyr::select(dup_type,
+    `Gene length (bp)`           = mean_gene_length,
+    `Distance to nearest gene`   = mean_dist_to_gene,
+    `Local gene density (genes/Mb)` = mean_local_density,
+    `Scaffold length (bp)`       = scaffold_chr_length_dup1
+  ) %>%
+  pivot_longer(-dup_type,
+               names_to  = "feature",
+               values_to = "value") %>%
+  filter(!is.na(value))
+
+p_ridges <- ggplot(long_feats,
+                   aes(x     = log1p(value),
+                       y     = dup_type,
+                       fill  = dup_type,
+                       color = dup_type)) +
+  geom_density_ridges(alpha           = 0.65,
+                      scale           = 1.2,
+                      quantile_lines  = TRUE,
+                      quantiles       = 2,        # show median
+                      rel_min_height  = 0.01) +
+  facet_wrap(~feature, scales = "free_x", ncol = 2) +
+  scale_fill_manual(values  = DUP_COLORS, guide = "none") +
+  scale_color_manual(values = DUP_COLORS, guide = "none") +
+  labs(
+    title    = "Predictor Distributions by Duplication Type",
+    subtitle = "log1p-transformed; vertical line = median per type",
+    x = "log1p(value)", y = NULL
+  )
+ggsave("eda_feature_distributions1.png", p_ridges,
+       width = 10, height = 8, dpi = 200)
+
+```
+
+
+```{r}
+
+p_opsin_comp <- pair_features_full %>%
+  filter(!is.na(either_opsin)) %>%
+  count(either_opsin, dup_type) %>%
+  group_by(either_opsin) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup() %>%
+  mutate(
+    group_label = if_else(
+      either_opsin,
+      paste0("Opsin-involving pairs\n(n = ",
+             sum(pair_features_full$either_opsin, na.rm = TRUE), ")"),
+      paste0("Non-opsin pairs\n(n = ",
+             sum(!pair_features_full$either_opsin, na.rm = TRUE), ")")
+    )
+  ) %>%
+  ggplot(aes(x = dup_type, y = pct, fill = dup_type)) +
+  geom_col(color = "#0d1117", linewidth = 0.6) +
+  geom_text(aes(label = sprintf("%.1f%%", pct)),
+            vjust = -0.4, size = 3) +
+  facet_wrap(~group_label) +
+  scale_fill_manual(values = DUP_COLORS, guide = "none") +
+  scale_y_continuous(labels = function(x) paste0(x, "%"),
+                     expand = expansion(mult = c(0, 0.18))) +
+  labs(
+    title    = "Duplication Type Composition: Opsin vs Non-Opsin Pairs",
+    subtitle = "Note the elevated TD proportion in opsin-involving pairs",
+    x = NULL, y = "% of pairs"
+  )
+p_opsin_comp
+```
+
+```{r}
+param_names <- c(
+  "b_mean_dist_to_gene",
+  "b_mean_local_density",
+  "b_mean_gene_length",
+  "b_scaffold_chr_length_dup1",
+  "b_either_opsinTRUE"
+)
+param_labels <- c(
+  "Distance to nearest gene",
+  "Local gene density",
+  "Gene length",
+  "Scaffold size",
+  "Either gene is opsin"
+)
+
+p_trace <- mcmc_trace(
+  as_draws_array(bayes_model),
+  pars = param_names,
+  facet_args = list(
+    labeller = labeller(
+      parameter = setNames(param_labels, param_names)
+    ),
+    ncol = 1
+  )
+) +
+  scale_color_manual(
+    values = c("#ff6b6b", "#4ecdc4", "#ffe66d", "#58a6ff")
+  ) +
+  labs(
+    title    = "MCMC Traceplots",
+    subtitle = paste("Healthy chains show random mixing",
+                     "with no trends or divergences")
+  )
+p_trace
+```
+```{r}
+ggsave("bayes_traceplotsRLP.png", p_trace,
+       width = 10, height = 12, dpi = 200)
+```
+
+```{r}
+posterior <- as_draws_matrix(bayes_model)
+
+p_post <- mcmc_areas(
+  posterior,
+  pars    = param_names,
+  prob    = 0.89,     # shaded region = 89% credible interval
+  prob_outer = 0.95   # outer whiskers = 95% CI
+) +
+  geom_vline(xintercept = 0, linetype = "dashed",
+             color = "#ffe66d", linewidth = 0.8) +
+  scale_y_discrete(labels = rev(param_labels)) +
+  labs(
+    title    = "Posterior Distributions",
+    subtitle = "Shaded = 89% credible interval; dashed = zero effect"
+  )
+p_post
+```
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,230 @@
+---
+title: "gene_features"
+output: html_document
+date: "2026-02-25"
+---
+
+## SCRIPT 1: Hydra vulgaris AEP Gene Feature Table
+
+### Install / load packages
+
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+library(data.table)
+library(rtracklayer)   # import() for GFF3
+library(GenomicRanges) # GRanges, distanceToNearest, countOverlaps
+library(IRanges)       # IRanges (dependency of GenomicRanges)
+library(dplyr)
+library(readr)
+library(stringr)
+library(tibble)
+```
+
+### Download files Go to "<https://research.nhgri.nih.gov/HydraAEP/download/>" and get the gene model coordinates and unzip it then put in working directory
+
+```{r}
+GFF3_FILE <- "HVAEP.GeneModels.gff3.gz"
+```
+
+### Parse GFF3 – keep gene-level features only
+
+```{r}
+gff_all <- import(GFF3_FILE)
+print(table(gff_all$type))
+```
+
+### Keep only gene-level features.
+
+Expected: 28,917 records for the AEP assembly.
+
+```{r}
+## 
+genes <- gff_all[gff_all$type == "gene"]
+length(genes)
+```
+
+### Pulling scaffold lengths from max(end) per scaffold
+
+Expect 15 chromosomes in this assembly of AEP
+
+```{r}
+scaf_max <- as.data.frame(gff_all) %>%
+  group_by(seqnames) %>%
+  summarise(scaffold_length = max(end), .groups = "drop")
+chr_lengths <- setNames(scaf_max$scaffold_length,
+                        as.character(scaf_max$seqnames))
+length(chr_lengths)
+```
+
+### Gene names
+
+AEP gene IDs follow the pattern: HVAEP\<scaffold#\>.G\<6-digit-number\> Example: HVAEP1.G000026
+
+```{r}
+#gene_name_vec <- get_attr(genes, "Name")
+gene_name_vec <- ifelse(is.na(gene_name_vec),
+                        get_attr(genes, "ID"),
+                        gene_name_vec)
+scaff_names <- as.character(seqnames(genes))
+print(head(gene_name_vec))
+```
+
+### Base table
+
+```{r}
+gene_df <- tibble(
+  gene_name           = gene_name_vec,
+  scaffold_chr        = scaff_names,
+  start               = start(genes),
+  end                 = end(genes),
+  strand              = as.character(strand(genes)),
+  gene_length         = width(genes),
+  scaffold_chr_length = chr_lengths[scaff_names]
+)
+nrow(gene_df)
+ncol(gene_df)
+```
+
+### Duplicate flag from dup_pairsAEP.tsv
+
+A gene is defined as a "duplicate" if it appears in at least one row of dup_pairsAEP.tsv (That you will need to get from the github and oh I hope its small enough to be stored there).
+
+```{r}
+# Something fun I had to learn painfully: dup_pairsAEP.tsv gene IDs carry an "AEP_" prefix (AEP_HVAEP1.G000026), but gene_df gene names do NOT (HVAEP1.G000026). The prefix MUST be stripped before joining, otherwise ALL genes would be flagged as non-duplicates... Yes this took longer than I admit to figure out
+dup_pairs <- read_tsv("dup_pairsAEP.tsv", col_types = cols()) 
+dup_pairs <- dplyr::rename(dup_pairs, dup_type = type)
+#don't ask me why i had to specifically call dplyr every time i used rename but without it, the code wouldn't run :)
+dup_pairs <- dup_pairs %>%
+    filter(!is.na(dup_type)) %>%
+    mutate(
+      dup1 = str_replace(dup1, "^AEP_", ""),
+      dup2 = str_replace(dup2, "^AEP_", "")
+    )
+print(count(dup_pairs, dup_type))
+```
+
+### Counting which are is_duplicate flag
+
+```{r}
+dup_type_lookup <- bind_rows(
+  dup_pairs %>% dplyr::select(gene_name = dup1, dup_type),
+  dup_pairs %>% dplyr::select(gene_name = dup2, dup_type)
+) %>%
+  dplyr::distinct(gene_name, .keep_all = TRUE)
+```
+
+### Join the dup_type onto gene_df and create is_duplicate
+
+The tidyr replace NA was key here
+
+```{r}
+gene_df <- gene_df %>%
+  left_join(dup_type_lookup, by = "gene_name") %>%
+  mutate(
+    dup_type= tidyr::replace_na(dup_type, "unique"),
+    is_duplicate= dup_type != "unique"
+  )
+# Genes with no match in dup_type_lookup get dup_type = "unique" and is_duplicate = FALSE.
+gene_df <- gene_df %>%
+  left_join(dup_type_lookup, by = "gene_name") %>%
+  mutate(
+    dup_type= tidyr::replace_na(dup_type, "unique"),
+    is_duplicate = dup_type != "unique"
+  )
+```
+
+### Taking a look at how many duplicates in the AEP genome
+
+```{r}
+print(table(gene_df$dup_type))
+```
+
+### Opsin flag
+
+Opsin genes are identified by exact match against the list of 50 gene IDs (AEP.txt) that I created by blasting known opsins against the AEP genome (I used Claude to help me remove the blank and header lines) Expect 50 from the sum
+
+```{r}
+opsin_ids <- readLines("AEP.txt") %>%
+  trimws() %>%
+  ## Remove blank lines and any header line
+  .[. != "" & . != "AEP"]
+gene_df <- gene_df %>%
+  mutate(is_opsin = gene_name %in% opsin_ids)
+sum(gene_df$is_opsin)
+```
+
+### Distance to nearest gene
+
+The sum is the amount of genes with measurable neighbour distance, mine was 28917
+
+```{r}
+gene_gr <- makeGRangesFromDataFrame(
+  gene_df,
+  seqnames.field     = "scaffold_chr",
+  start.field        = "start",
+  end.field          = "end",
+  strand.field       = "strand",
+  keep.extra.columns = FALSE
+)
+
+dist_hits <- distanceToNearest(gene_gr, ignore.strand = TRUE)
+
+dist_vec <- rep(NA_real_, nrow(gene_df))
+dist_vec[queryHits(dist_hits)] <- mcols(dist_hits)$distance
+
+gene_df$dist_near_gene <- dist_vec
+sum(!is.na(gene_df$dist_near_gene))
+```
+
+### Local gene density (±500 kb window)
+
+I also got help for this one
+
+```{r}
+WINDOW <- 500000L
+## Expand each gene's range to a centered window.
+## fix = "center" anchors the resize on the gene midpoint.
+gene_gr_windows <- resize(
+  gene_gr,
+  width = 2L * WINDOW + width(gene_gr),
+  fix   = "center"
+)
+## Count overlapping genes in each window (ignoring strand).
+## This counts the focal gene itself, so we subtract 1.
+overlap_counts <- countOverlaps(gene_gr_windows, gene_gr,
+                                ignore.strand = TRUE) - 1L
+## Convert to genes per Mb: divide by window size in Mb.
+## The window is 2*WINDOW bp = 2*WINDOW / 1e6 Mb.
+gene_df$local_gene_density <- overlap_counts / (2L * WINDOW / 1e6)
+print(summary(gene_df$local_gene_density))
+```
+
+### Final table
+
+```{r}
+gene_table <- gene_df %>%
+  dplyr::select(
+    gene_name,
+    scaffold_chr,
+    start,
+    end,
+    strand,
+    gene_length,
+    scaffold_chr_length,
+    is_duplicate,
+    dup_type,
+    is_opsin,
+    dist_near_gene,
+    local_gene_density
+  )
+print(head(gene_table, 10))
+```
+
+### Save output for Script 2
+
+```{r}
+write_csv(gene_table, "hydra_aep_gene_table.csv")
+saveRDS(gene_table,   "hydra_aep_gene_table.rds")
+```
