@@ -12,3 +12,8 @@ Predictor variables:
 NEED: Gene-level feature table
 
 THEN: Run model dup_type~distance_to_gene+ gene_density+ gene_length+ chrom_size+ gene_ID
+
+
+Audience: This analysis is written for evolutionary biologists with familiarity with R, basic Bayesian statistics, and genomics.
+
+
