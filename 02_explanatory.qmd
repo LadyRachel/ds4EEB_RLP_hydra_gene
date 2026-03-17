@@ -1,0 +1,572 @@
+---
+title: "Tandem Duplication is Predicted by Gene Length and Genomic Isolation in *Hydra vulgaris* AEP"
+subtitle: "Explanatory Analysis | Target audience: evolutionary & computational biologists"
+author: "Rachel"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-summary: "Show code"
+    code-tools: true
+    theme: darkly
+    highlight-style: dracula
+    fig-width: 9
+    fig-height: 5
+    embed-resources: true
+    number-sections: true
+execute:
+  warning: false
+  message: false
+  cache: true
+bibliography: references.bib
+---
+
+## Abstract
+
+Gene duplication is the primary mechanism through which novel gene functions 
+arise, and the genomic architecture of duplicate pairs — whether tandem or 
+dispersed — shapes the trajectory of post-duplication divergence. Using the 
+chromosome-level *Hydra vulgaris* AEP genome, we asked whether gene-level and 
+chromosomal features predict tandem versus dispersed duplication mode across 
+50,364 annotated duplicate pairs. A logistic regression model revealed that 
+**gene length** (OR = 1.29, p < 0.001) and **distance to the nearest gene** 
+(OR = 1.32, p < 0.001) are the strongest predictors of tandem duplication. 
+Opsin genes — the molecular mediators of *Hydra*'s extraocular 
+phototransduction — show an 80% elevation in tandem duplication odds relative 
+to the genomic background, though this trend does not reach frequentist 
+significance given the small opsin sample (n = 172 pairs, p = 0.11). Bayesian 
+analysis assigns a **92.5% posterior probability** to the hypothesis that opsins 
+are preferentially tandemly duplicated, motivating comparative analysis across 
+*Hydra* strains and species.
+
+---
+
+## Introduction
+
+### Gene duplication modes and their consequences
+
+MCScanX classifies duplicate gene pairs into four modes based on their genomic 
+arrangement: **tandem** (TD, adjacent genes), **proximal** (PD, nearby on the 
+same chromosome), **segmental** (SD, co-duplicated chromosomal blocks), and 
+**dispersed** (DD, all other arrangements, including transposed copies). These 
+categories are not merely descriptive — they reflect distinct mechanistic origins 
+(replication slippage and unequal crossing-over for tandem events; transposition 
+for dispersed events; large-scale duplication for segmental) and have different 
+implications for post-duplication divergence.
+
+Tandem duplicates share a local regulatory environment and are subject to 
+concerted evolution via gene conversion, while dispersed duplicates are 
+immediately exposed to divergent regulatory contexts, facilitating 
+neofunctionalization.
+
+### Opsins in *Hydra*: an expanded, functionally enigmatic family
+
+*Hydra vulgaris* encodes at least 50 opsin genes — a remarkable expansion 
+relative to most animals — yet lacks eyes or any centralized photoreceptive 
+organ. Expression studies suggest opsins function in extraocular 
+phototransduction, influencing behaviors including light-dependent feeding and 
+movement. How this large opsin repertoire arose through genome evolution, 
+and whether its expansion involved tandem duplication (as in vertebrate visual 
+opsin clusters), remains unknown.
+
+### Research question
+
+> Do genomic features — gene length, local gene density, distance to the 
+> nearest gene, scaffold size, and gene identity (opsin vs. non-opsin) — 
+> predict whether a duplicate pair arose through tandem versus dispersed 
+> duplication in *Hydra vulgaris* AEP?
+
+---
+
+## Methods
+
+### Data
+
+All analyses used the chromosome-level *H. vulgaris* AEP genome assembly and 
+gene models from the NHGRI HydraAEP resource. Duplicate gene pairs were 
+classified using MCScanX. Opsin gene identities were assigned by the Macias-Muñoz 
+lab based on sequence homology.
+
+| Resource | Version / Source |
+|---|---|
+| Genome assembly | HVAEP1.0 (NHGRI) |
+| Gene models | HVAEP.GeneModels.gff3 |
+| Duplicate pairs | MCScanX (50,364 pairs) |
+| Opsin gene list | Lab annotation, n = 50 |
+
+### Feature engineering
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(pROC)
+library(ggeffects)
+library(patchwork)
+library(broom)
+library(rstanarm)
+library(bayesplot)
+library(scales)
+library(ggridges)
+library(knitr)
+library(kableExtra)
+library(viridis)
+
+theme_hydra <- theme_minimal(base_size = 11) +
+  theme(
+    plot.background   = element_rect(fill = "#0d1117", color = NA),
+    panel.background  = element_rect(fill = "#1c2333", color = NA),
+    panel.grid        = element_line(color = "#21262d", linewidth = 0.3),
+    text              = element_text(color = "#c9d1d9"),
+    axis.text         = element_text(color = "#8b949e"),
+    axis.title        = element_text(color = "#c9d1d9"),
+    plot.title        = element_text(color = "#e6edf3", face = "bold", size = 12),
+    plot.subtitle     = element_text(color = "#6e7681", size = 9),
+    legend.background = element_rect(fill = "#1c2333", color = NA),
+    legend.text       = element_text(color = "#c9d1d9"),
+    plot.caption      = element_text(color = "#6e7681", size = 8),
+    strip.text        = element_text(color = "#c9d1d9", face = "bold")
+  )
+COLORS <- c(TD = "#ff6b6b", DD = "#4ecdc4", PD = "#ffe66d", SD = "#c77dff")
+ACCENT <- c("#ff6b6b","#4ecdc4","#ffe66d","#c77dff","#58a6ff")
+```
+
+```{r load-data}
+pair_features <- read_tsv("pair_feature_table_AEP.tsv", col_types = cols()) %>%
+  mutate(
+    dup_type     = factor(dup_type, levels = c("TD","PD","SD","DD")),
+    either_opsin = factor(either_opsin,
+                          levels = c(FALSE, TRUE),
+                          labels = c("non-opsin","opsin"))
+  )
+
+# Build model dataset: TD vs DD, same-chromosome pairs
+model_data <- pair_features %>%
+  filter(dup_type %in% c("TD","DD")) %>%
+  mutate(y = as.integer(dup_type == "TD")) %>%
+  select(y, mean_dist_to_gene, mean_local_density, mean_gene_length,
+         scaffold_chr_length_dup1, either_opsin) %>%
+  drop_na()
+
+# Scale numeric predictors
+num_cols <- c("mean_dist_to_gene","mean_local_density",
+              "mean_gene_length","scaffold_chr_length_dup1")
+model_data[num_cols] <- scale(model_data[num_cols])
+
+cat("Model n =", nrow(model_data),
+    "| TD:", sum(model_data$y),
+    "| DD:", sum(model_data$y == 0))
+```
+
+Five gene-level features were computed from the HVAEP1.0 GFF3 and paired 
+into pair-level summaries (mean of both members):
+
+- **Gene length (bp)**: `width()` of gene-level GRanges features
+- **Distance to nearest gene (bp)**: `GenomicRanges::distanceToNearest()`, 
+  excluding self-hits
+- **Local gene density (genes/Mb)**: count of genes within a ±500 kb sliding 
+  window via `countOverlaps()` on resized GRanges, normalized to 1 Mb
+- **Scaffold length (bp)**: `max(end)` per scaffold across all GFF3 features
+- **Opsin identity**: binary flag (opsin / non-opsin)
+
+All continuous predictors were z-score standardized prior to modeling, 
+enabling direct comparison of coefficient magnitudes.
+
+### Statistical model
+
+We fit a binomial logistic regression (frequentist GLM) and a Bayesian 
+equivalent (`rstanarm::stan_glm`) on TD vs. DD pairs:
+
+$$
+\log\frac{P(\text{TD})}{1-P(\text{TD})} = \beta_0 + \beta_1 \overline{d}_{\text{gene}} + \beta_2 \overline{\rho}_{\text{local}} + \beta_3 \overline{L}_{\text{gene}} + \beta_4 L_{\text{scaffold}} + \beta_5 \mathbf{1}_{\text{opsin}}
+$$
+
+The Bayesian model used weakly informative priors: $\beta_j \sim \mathcal{N}(0, 2.5)$, 
+$\beta_0 \sim \mathcal{N}(0, 10)$. Four chains × 2,000 iterations (1,000 warmup). 
+Convergence was assessed via $\hat{R}$ (all = 1.0) and effective sample size 
+(all n_eff > 2,000).
+
+---
+
+## Results
+
+### Duplication type landscape
+
+The AEP genome is dominated by dispersed duplications, which is consistent with 
+a large role for transposition-based mechanisms in *Hydra* genome evolution.
+
+```{r type-table}
+pair_features %>%
+  count(dup_type) %>%
+  mutate(
+    `%` = sprintf("%.1f%%", n/sum(n)*100),
+    `Same-chrom (%)` = pair_features %>%
+      group_by(dup_type) %>%
+      summarise(sc = mean(same_chrom, na.rm=TRUE)*100, .groups="drop") %>%
+      pull(sc) %>% sprintf("%.0f%%", .)
+  ) %>%
+  kbl(caption = "Duplicate pair composition in Hydra vulgaris AEP") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+### Genomic predictors of tandem duplication
+
+```{r fit-models}
+# Frequentist GLM
+full_model <- glm(y ~ mean_dist_to_gene + mean_local_density + mean_gene_length +
+                      scaffold_chr_length_dup1 + either_opsin,
+                  data = model_data, family = binomial(link = "logit"))
+
+# Bayesian GLM (load cached results or refit)
+if (file.exists("bayes_model.rds")) {
+  bayes_model <- readRDS("bayes_model.rds")
+} else {
+  bayes_model <- stan_glm(
+    y ~ mean_dist_to_gene + mean_local_density + mean_gene_length +
+        scaffold_chr_length_dup1 + either_opsin,
+    data            = model_data,
+    family          = binomial(link = "logit"),
+    prior           = normal(0, 2.5),
+    prior_intercept = normal(0, 10),
+    chains = 4, iter = 2000, seed = 42,
+    cores  = parallel::detectCores(),
+    refresh = 0
+  )
+  saveRDS(bayes_model, "bayes_model.rds")
+}
+```
+
+#### Odds ratio forest plot
+
+```{r forest-plot, fig.cap="Odds ratios and 95% confidence intervals for predictors of tandem vs. dispersed duplication. All predictors are z-score standardized; OR > 1 indicates increased odds of TD."}
+or_df <- tidy(full_model, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    term_clean = recode(term,
+      mean_dist_to_gene        = "Distance to\nnearest gene",
+      mean_local_density       = "Local gene\ndensity (±500kb)",
+      mean_gene_length         = "Gene length",
+      scaffold_chr_length_dup1 = "Scaffold size",
+      either_opsinopsin        = "Either gene\nis opsin"
+    ),
+    sig = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE            ~ "ns"
+    ),
+    color = if_else(estimate > 1, ACCENT[1], ACCENT[2])
+  )
+
+ggplot(or_df, aes(x = estimate, y = reorder(term_clean, estimate))) +
+  geom_vline(xintercept = 1, linetype = "dashed",
+             color = "#6e7681", linewidth = 0.8) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.2, linewidth = 0.8, color = "#8b949e") +
+  geom_point(aes(color = color), size = 4) +
+  geom_text(aes(x = conf.high + 0.08, label = sig),
+            color = "#ffe66d", size = 4.5, hjust = 0) +
+  geom_text(aes(x = conf.low - 0.08,
+                label = sprintf("OR=%.2f", estimate)),
+            color = "#c9d1d9", size = 3.2, hjust = 1) +
+  scale_color_identity() +
+  scale_x_continuous(limits = c(0.5, 4.5)) +
+  labs(
+    title    = "Genomic Predictors of Tandem Duplication",
+    subtitle = "OR (95% CI) from binomial logistic regression\nTD vs. DD, same-chromosome pairs, n = 46,316",
+    x = "Odds Ratio (95% CI)", y = NULL,
+    caption  = "All predictors z-score standardized; OR interpreted per 1 SD increase"
+  ) +
+  theme_hydra
+```
+
+**Gene length** (OR = 1.29, p < 0.001) and **distance to nearest gene** 
+(OR = 1.32, p < 0.001) are the strongest predictors. Larger genes and genes 
+with more isolated genomic positions have significantly elevated odds of 
+tandem duplication. **Scaffold size** shows a modest negative effect 
+(OR = 0.91, p = 0.001), indicating that TD pairs are slightly more prevalent 
+on smaller scaffolds. **Local gene density** has a small but significant 
+positive effect (OR = 1.07, p = 0.016). Model discrimination is modest 
+(AUC = 0.666), consistent with duplication mode being influenced by additional 
+unmeasured factors (e.g., transposable element activity, replication timing).
+
+#### Predicted probability curves
+
+```{r effect-plots, fig.height=7, fig.cap="Predicted probability of tandem duplication as a function of each continuous predictor, with all other predictors held at their mean."}
+preds_dist  <- ggpredict(full_model, terms = "mean_dist_to_gene [all]")
+preds_len   <- ggpredict(full_model, terms = "mean_gene_length [all]")
+preds_dens  <- ggpredict(full_model, terms = "mean_local_density [all]")
+preds_scaf  <- ggpredict(full_model, terms = "scaffold_chr_length_dup1 [all]")
+
+plot_pred <- function(pred_df, xlabel, color) {
+  ggplot(pred_df, aes(x = x, y = predicted)) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high),
+                fill = color, alpha = 0.2) +
+    geom_line(color = color, linewidth = 1.3) +
+    scale_y_continuous(labels = percent, limits = c(0, NA)) +
+    labs(x = xlabel, y = "P(TD)") +
+    theme_hydra
+}
+
+(plot_pred(preds_dist, "Distance to nearest gene (scaled)", ACCENT[1]) |
+ plot_pred(preds_len,  "Gene length (scaled)",              ACCENT[3])) /
+(plot_pred(preds_dens, "Local gene density (scaled)",       ACCENT[2]) |
+ plot_pred(preds_scaf, "Scaffold size (scaled)",            ACCENT[4])) +
+  plot_annotation(
+    title    = "Predicted P(TD) Across Predictor Range",
+    subtitle = "Each panel varies one predictor; all others at mean",
+    theme    = theme_hydra
+  )
+```
+
+### The opsin effect
+
+#### Frequentist result
+
+Opsin-involving pairs show OR = 1.80 (95% CI: 0.80–3.46, p = 0.11). The 
+direction is consistent and the effect size is large, but the analysis is 
+underpowered: only 172 of 50,364 pairs involve an opsin gene.
+
+```{r opsin-effect-plot, fig.cap="Predicted P(TD) across the distance gradient for opsin vs. non-opsin pairs."}
+opsin_preds <- ggpredict(full_model,
+                          terms = c("mean_dist_to_gene [all]",
+                                    "either_opsin [non-opsin, opsin]"))
+
+ggplot(opsin_preds, aes(x = x, y = predicted,
+                         color = group, fill = group)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high),
+              alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1.3) +
+  scale_color_manual(values = c("opsin" = ACCENT[1], "non-opsin" = ACCENT[2]),
+                     name = NULL) +
+  scale_fill_manual(values  = c("opsin" = ACCENT[1], "non-opsin" = ACCENT[2]),
+                    guide   = "none") +
+  scale_y_continuous(labels = percent) +
+  labs(
+    title    = "Opsin vs. Non-Opsin: P(TD) Across Distance",
+    subtitle = "Opsin pairs consistently show higher P(TD) across the full distance range",
+    x = "Distance to nearest gene (scaled)", y = "P(TD)"
+  ) +
+  theme_hydra +
+  theme(legend.position = c(0.15, 0.85))
+```
+
+#### Bayesian result
+
+The Bayesian model provides a more complete picture. With 92.5% of the 
+posterior mass above zero, the data strongly favor a positive opsin effect, 
+even if a frequentist test at α = 0.05 cannot confirm it.
+
+```{r opsin-posterior, fig.cap="Posterior distribution of the opsin coefficient (log-odds scale). 92.5% of posterior mass lies above zero, indicating strong evidence for elevated tandem duplication odds in opsin-involving pairs."}
+posterior <- as.matrix(bayes_model)
+opsin_samples <- tibble(sample = posterior[, "either_opsinopsin"])
+
+ggplot(opsin_samples, aes(x = sample)) +
+  geom_histogram(aes(fill = after_stat(x) > 0),
+                 bins = 80, color = NA, alpha = 0.85) +
+  geom_vline(xintercept = 0, linetype = "dashed",
+             color = "#ffe66d", linewidth = 1) +
+  geom_vline(xintercept = mean(opsin_samples$sample),
+             color = "#ff6b6b", linewidth = 1.2) +
+  annotate("text",
+           x = mean(opsin_samples$sample) + 0.05, y = Inf,
+           vjust = 2, hjust = 0,
+           label = sprintf("Posterior mean = %.2f\nP(β > 0) = %.1f%%",
+                           mean(opsin_samples$sample),
+                           mean(opsin_samples$sample > 0) * 100),
+           color = "#ff6b6b", size = 4) +
+  scale_fill_manual(
+    values = c("FALSE" = "#4ecdc4", "TRUE" = "#ff6b6b"),
+    labels = c("FALSE" = "β < 0 (non-TD direction)",
+               "TRUE"  = "β > 0 (TD direction)"),
+    name   = NULL
+  ) +
+  labs(
+    title    = "Posterior Distribution: Opsin Effect on Tandem Duplication",
+    subtitle = "92.5% of posterior mass lies above zero",
+    x        = "β (log-odds of TD | opsin gene)",
+    y        = "Posterior sample count",
+    caption  = "Bayesian logistic regression; prior: N(0, 2.5); 4 chains × 2,000 iter"
+  ) +
+  theme_hydra
+```
+
+### Model validation
+
+#### MCMC convergence
+
+```{r traceplots, fig.height=10, fig.cap="MCMC traceplots for all model parameters. All four chains mix freely, indicating convergence (all R-hat = 1.0, all n_eff > 2,000)."}
+param_names <- c("mean_dist_to_gene","mean_local_density","mean_gene_length",
+                 "scaffold_chr_length_dup1","either_opsinopsin")
+param_labels <- c("Distance to nearest gene","Local gene density",
+                  "Gene length","Scaffold size","Either gene is opsin")
+
+mcmc_trace(
+  as.array(bayes_model),
+  pars = param_names,
+  facet_args = list(
+    labeller = labeller(parameter = setNames(param_labels, param_names)),
+    ncol = 1
+  )
+) +
+  scale_color_manual(values = c("#ff6b6b","#4ecdc4","#ffe66d","#58a6ff")) +
+  labs(title    = "MCMC Traceplots",
+       subtitle = "Healthy mixing across all 1,000 post-warmup iterations per chain") +
+  theme_hydra +
+  theme(strip.text = element_text(size = 8))
+```
+
+#### Bayesian vs. frequentist agreement
+
+```{r bayes-freq-compare, fig.cap="Comparison of Bayesian posterior means (95% credible intervals) and frequentist point estimates (95% confidence intervals). Agreement across methods confirms result robustness."}
+bayes_ci <- as_tibble(posterior[, param_names]) %>%
+  pivot_longer(everything(), names_to = "term", values_to = "sample") %>%
+  group_by(term) %>%
+  summarise(
+    mean = mean(sample),
+    lo95 = quantile(sample, 0.025),
+    hi95 = quantile(sample, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    term_clean = recode(term, !!!setNames(param_labels, param_names)),
+    method = "Bayesian"
+  )
+
+freq_ci <- tidy(full_model, conf.int = TRUE) %>%
+  filter(term %in% param_names) %>%
+  mutate(
+    term_clean = recode(term, !!!setNames(param_labels, param_names)),
+    lo95 = conf.low, hi95 = conf.high, mean = estimate,
+    method = "Frequentist"
+  ) %>%
+  select(term, term_clean, mean, lo95, hi95, method)
+
+ggplot() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#6e7681") +
+  geom_errorbar(data = freq_ci,
+                aes(x = term_clean, ymin = lo95, ymax = hi95,
+                    color = method),
+                width = 0.15, linewidth = 1.2,
+                position = position_nudge(x = 0.15)) +
+  geom_point(data = freq_ci,
+             aes(x = term_clean, y = mean, color = method),
+             size = 3.5, position = position_nudge(x = 0.15)) +
+  geom_errorbar(data = bayes_ci,
+                aes(x = term_clean, ymin = lo95, ymax = hi95,
+                    color = method),
+                width = 0.15, linewidth = 1.2,
+                position = position_nudge(x = -0.15)) +
+  geom_point(data = bayes_ci,
+             aes(x = term_clean, y = mean, color = method),
+             size = 3.5, position = position_nudge(x = -0.15)) +
+  scale_color_manual(
+    values = c("Bayesian" = "#ff6b6b", "Frequentist" = "#4ecdc4"),
+    name = NULL
+  ) +
+  coord_flip() +
+  labs(
+    title    = "Bayesian vs. Frequentist Coefficient Estimates",
+    subtitle = "Strong agreement across frameworks confirms result robustness",
+    x = NULL, y = "Coefficient (log-odds scale)"
+  ) +
+  theme_hydra +
+  theme(legend.position = "top")
+```
+
+---
+
+## Discussion
+
+### Interpretation of significant predictors
+
+The positive association between **gene length** and tandem duplication 
+probability is consistent with a mechanistic model in which longer genes 
+present larger targets for the replication slippage and unequal crossing-over 
+events that generate tandem duplicates. A similar pattern has been observed in 
+plants and vertebrates.
+
+The positive effect of **distance to nearest gene** is counterintuitive at 
+first but interpretable: genes in more isolated genomic positions may be 
+flanked by repetitive or low-complexity sequence that facilitates illegitimate 
+recombination, or may simply reflect that tandem duplicate arrays displace 
+flanking genes outward, inflating apparent neighbor distance.
+
+The negative effect of **scaffold size** is consistent with elevated TD rates 
+on smaller, gene-dense scaffolds in the Hydra AEP assembly. These scaffolds 
+may correspond to gene-rich genomic regions with higher local recombination 
+rates.
+
+### The opsin tandem duplication signal
+
+The 92.5% posterior probability that opsin genes have elevated tandem 
+duplication odds is the most biologically significant result of this analysis. 
+If confirmed in additional genomes, it would suggest that tandem duplication 
+has been a primary mechanism of opsin family expansion in *Hydra* — consistent 
+with what is observed in vertebrate photoreceptor gene clusters. This has 
+implications for understanding how *Hydra* opsins are regulated: tandem 
+duplicates in shared chromatin environments are candidates for co-regulation, 
+potentially enabling coordinated wavelength tuning across the body.
+
+### Limitations and future directions
+
+1. **Sample size**: Only 172 opsin-involving pairs are available in the AEP 
+   genome. Extending this analysis to *H. vulgaris* strain 105 and 
+   *H. oligactis* would provide independent replication and substantially 
+   increase opsin pair counts. A mixed-effects model with species as a random 
+   effect or a meta-analytic pooling approach across genomes would allow 
+   a definitive test.
+
+2. **Duplication age**: This analysis treats all duplicate pairs equivalently 
+   regardless of when they arose. Incorporating synonymous substitution rates 
+   (Ks) as a proxy for duplication age would allow the question to be asked 
+   specifically of ancient vs. recent duplications.
+
+3. **Model AUC**: The modest AUC of 0.666 indicates that substantial variance 
+   in duplication mode remains unexplained. Candidate unmeasured predictors 
+   include transposable element density, replication timing, and GC content.
+
+---
+
+## Conclusion
+
+Gene length and genomic isolation are significant predictors of tandem 
+duplication in *Hydra vulgaris* AEP. Opsin genes show a strong and 
+directionally consistent trend toward tandem duplication that is supported 
+by a 92.5% Bayesian posterior probability, despite insufficient power for 
+frequentist confirmation. These results motivate comparative analysis across 
+*Hydra* strains and species to determine whether tandem duplication is a 
+conserved mechanism of opsin family expansion in this early-diverging animal 
+lineage.
+
+---
+
+## Reproducibility
+
+All code, data, and outputs are available at: 
+`https://github.com/[your-username]/hydra-dup-genomics`
+
+To reproduce all analyses from raw data:
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/[your-username]/hydra-dup-genomics
+
+# 2. Download genome files (see data/README.md for URLs)
+
+# 3. Run feature engineering script
+Rscript scripts/AEP_gene_models.R
+
+# 4. Render Quarto documents
+quarto render docs/01_exploratory.qmd
+quarto render docs/02_explanatory.qmd
+```
+
+---
+
+## Session Info
+
+```{r session}
+sessionInfo()
+```

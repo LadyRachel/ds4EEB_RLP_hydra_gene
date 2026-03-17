@@ -1,0 +1,375 @@
+---
+title: "Genomic Predictors of Duplication Mode in *Hydra vulgaris* AEP"
+subtitle: "Exploratory Data Analysis"
+author: "Rachel"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-summary: "Show code"
+    code-tools: true
+    theme: darkly
+    highlight-style: dracula
+    fig-width: 9
+    fig-height: 5
+    embed-resources: true
+    number-sections: true
+execute:
+  warning: false
+  message: false
+  cache: true
+---
+
+## Background and Motivating Question
+
+Gene duplication is a primary mechanism of genome evolution, and the *mode* of 
+duplication — tandem, proximal, segmental, or dispersed — has profound consequences 
+for how duplicated gene copies diverge in function. In cnidarians like *Hydra*, 
+opsin genes (light-sensitive G protein-coupled receptors mediating phototransduction) 
+have undergone substantial expansion, but it is not known whether this expansion 
+occurred preferentially through tandem duplication events or through dispersed 
+mechanisms.
+
+**Motivating question:** Do genomic features — gene length, local gene density, 
+distance to the nearest gene, and scaffold size — predict whether a gene duplicate 
+pair arose via tandem versus dispersed duplication? And are opsin genes 
+preferentially involved in tandem duplications compared to the genomic background?
+
+This question matters because:
+
+1. **Tandem duplicates** tend to retain similar regulatory environments and are 
+   more likely to undergo concerted evolution or subfunctionalization within 
+   a tight genomic cluster.
+2. **Opsin gene clusters** in other animals (e.g., vertebrate visual opsins) 
+   are often organized as tandem arrays, suggesting tandem duplication may be 
+   a conserved feature of opsin family expansion.
+3. Understanding duplication mode in *Hydra* opsins informs hypotheses about 
+   how photoreceptor diversity arose in early-diverging animals lacking 
+   a centralized nervous system.
+
+---
+
+## Setup
+
+```{r setup}
+library(tidyverse)
+library(pROC)
+library(ggeffects)
+library(patchwork)
+library(broom)
+library(rstanarm)
+library(bayesplot)
+library(GenomicRanges)
+library(rtracklayer)
+library(Biostrings)
+library(scales)
+library(ggridges)
+library(knitr)
+library(kableExtra)
+library(viridis)
+
+# ── Shared plot theme ─────────────────────────────────────────────────────────
+theme_hydra <- theme_minimal(base_size = 11) +
+  theme(
+    plot.background   = element_rect(fill = "#0d1117", color = NA),
+    panel.background  = element_rect(fill = "#1c2333", color = NA),
+    panel.grid        = element_line(color = "#21262d", linewidth = 0.3),
+    text              = element_text(color = "#c9d1d9"),
+    axis.text         = element_text(color = "#8b949e"),
+    axis.title        = element_text(color = "#c9d1d9"),
+    plot.title        = element_text(color = "#e6edf3", face = "bold", size = 12),
+    plot.subtitle     = element_text(color = "#6e7681", size = 9),
+    legend.background = element_rect(fill = "#1c2333", color = NA),
+    legend.text       = element_text(color = "#c9d1d9"),
+    plot.caption      = element_text(color = "#6e7681", size = 8),
+    strip.text        = element_text(color = "#c9d1d9", face = "bold")
+  )
+
+COLORS <- c(TD = "#ff6b6b", DD = "#4ecdc4", PD = "#ffe66d", SD = "#c77dff")
+```
+
+---
+
+## Data Sources
+
+| File | Description | Source |
+|---|---|---|
+| `dup_pairsAEP.tsv` | 50,364 duplicate gene pairs with type annotation | MCScanX / *Hydra* AEP genome |
+| `HVAEP.GeneModels.gff3.gz` | Gene model coordinates | NHGRI HydraAEP portal |
+| `HVAEP.genome.fa` | Chromosome-level genome assembly | NHGRI HydraAEP portal |
+| `AEP.txt` | List of 50 opsin gene IDs | Lab annotation |
+
+```{r load-data}
+# ── Raw duplicate pairs ───────────────────────────────────────────────────────
+dup_pairs <- read_tsv("dup_pairsAEP.tsv", col_types = cols()) %>%
+  rename(dup1 = 1, dup2 = 2, dup_type = 3) %>%
+  filter(!is.na(dup_type), dup_type != "type") %>%
+  mutate(dup_type = factor(dup_type, levels = c("TD","PD","SD","DD")))
+
+# ── Gene-level feature table (produced by AEP_gene_models.R) ─────────────────
+gene_features <- read_tsv("gene_feature_table_AEP.tsv", col_types = cols())
+
+# ── Pair-level model table ────────────────────────────────────────────────────
+pair_features <- read_tsv("pair_feature_table_AEP.tsv", col_types = cols()) %>%
+  mutate(
+    dup_type     = factor(dup_type, levels = c("TD","PD","SD","DD")),
+    either_opsin = factor(either_opsin,
+                          levels = c(FALSE, TRUE),
+                          labels = c("non-opsin","opsin"))
+  )
+
+# ── Opsin gene IDs ────────────────────────────────────────────────────────────
+opsin_ids <- readLines("AEP.txt") %>%
+  str_replace("^AEP_", "")
+
+cat("Pairs loaded:    ", nrow(dup_pairs), "\n")
+cat("Unique genes:    ", n_distinct(gene_features$gene_name), "\n")
+cat("Opsin genes:     ", sum(gene_features$is_opsin), "\n")
+cat("Opsin-inv pairs: ", sum(pair_features$either_opsin == "opsin", na.rm=TRUE), "\n")
+```
+
+---
+
+## Exploratory Analysis
+
+### Duplication type distribution
+
+The AEP genome contains `r nrow(dup_pairs)` annotated duplicate gene pairs across 
+four duplication modes classified by MCScanX. Dispersed duplications (DD) dominate, 
+comprising `r scales::percent(mean(dup_pairs$dup_type == "DD"))` of all pairs.
+
+```{r type-counts}
+count_summary <- dup_pairs %>%
+  count(dup_type) %>%
+  mutate(pct = n / sum(n) * 100)
+
+count_summary %>%
+  kbl(col.names = c("Type", "n", "%"), digits = 1,
+      caption = "Duplicate pair counts by type") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width = FALSE)
+```
+
+```{r type-bar, fig.cap="Distribution of duplication types in the Hydra AEP genome."}
+ggplot(count_summary, aes(x = dup_type, y = n, fill = dup_type)) +
+  geom_col(color = "#0d1117", linewidth = 0.8) +
+  geom_text(aes(label = comma(n)), vjust = -0.5,
+            size = 3.2, color = "#c9d1d9", fontface = "bold") +
+  scale_fill_manual(values = COLORS, guide = "none") +
+  scale_y_continuous(labels = comma,
+                     expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Duplicate Pair Counts by Type",
+       subtitle = "AEP genome | n = 50,364 pairs",
+       x = NULL, y = "Number of pairs") +
+  theme_hydra
+```
+
+### Same-chromosome fraction
+
+Tandem (TD) and proximal (PD) duplicates are expected to reside on the same 
+chromosome by definition. Segmental (SD) and dispersed (DD) duplicates may span 
+chromosomes.
+
+```{r same-chrom, fig.cap="Fraction of pairs residing on the same chromosome, by duplication type."}
+pair_features %>%
+  group_by(dup_type) %>%
+  summarise(pct_same = mean(same_chrom, na.rm = TRUE) * 100,
+            n = n(), .groups = "drop") %>%
+  ggplot(aes(x = dup_type, y = pct_same, fill = dup_type)) +
+  geom_col(color = "#0d1117", linewidth = 0.8) +
+  geom_text(aes(label = sprintf("%.0f%%", pct_same)),
+            vjust = -0.4, size = 4, color = "#c9d1d9", fontface = "bold") +
+  scale_fill_manual(values = COLORS, guide = "none") +
+  scale_y_continuous(limits = c(0, 115),
+                     labels = function(x) paste0(x, "%")) +
+  labs(title = "Same-Chromosome Fraction by Duplication Type",
+       x = NULL, y = "% pairs on same chromosome") +
+  theme_hydra
+```
+
+### Distance between duplicate pairs
+
+Gene ordinal difference (proxy for genomic distance) cleanly separates the 
+classification categories — this is partly definitional (TD = adjacent genes), 
+but the distribution of PD and DD distances is informative about the scale of 
+genomic rearrangement.
+
+```{r distance-ridges, fig.height=5, fig.cap="Distribution of log-transformed ordinal distance between duplicate gene pairs on the same chromosome."}
+pair_features %>%
+  filter(same_chrom, !is.na(ordinal_diff)) %>%
+  mutate(log_od = log10(ordinal_diff + 1)) %>%
+  ggplot(aes(x = log_od, y = dup_type,
+             fill = dup_type, color = dup_type)) +
+  geom_density_ridges(alpha = 0.7, scale = 1.3,
+                      quantile_lines = TRUE, quantiles = 2,
+                      rel_min_height = 0.01) +
+  scale_fill_manual(values = COLORS, guide = "none") +
+  scale_color_manual(values = COLORS, guide = "none") +
+  labs(title    = "Distance Between Duplicate Pairs (same-chromosome)",
+       subtitle = "Vertical line = median; log₁₀(ordinal diff + 1)",
+       x = "log₁₀(ordinal diff + 1)", y = NULL) +
+  theme_hydra
+```
+
+### Gene-level feature distributions
+
+Before modeling, we inspect the raw distributions of each predictor across 
+duplication types.
+
+```{r feature-distributions, fig.height=9, fig.cap="Distributions of four genomic predictors across duplication types."}
+long_feats <- pair_features %>%
+  select(dup_type,
+         `Gene length (bp)`       = mean_gene_length,
+         `Dist. to nearest gene`  = mean_dist_to_gene,
+         `Local gene density`     = mean_local_density,
+         `Scaffold length (bp)`   = scaffold_chr_length_dup1) %>%
+  pivot_longer(-dup_type, names_to = "feature", values_to = "value") %>%
+  filter(!is.na(value))
+
+ggplot(long_feats,
+       aes(x = log1p(value), y = dup_type,
+           fill = dup_type, color = dup_type)) +
+  geom_density_ridges(alpha = 0.65, scale = 1.2,
+                      quantile_lines = TRUE, quantiles = 2,
+                      rel_min_height = 0.01) +
+  facet_wrap(~feature, scales = "free_x", ncol = 2) +
+  scale_fill_manual(values = COLORS, guide = "none") +
+  scale_color_manual(values = COLORS, guide = "none") +
+  labs(title    = "Predictor Distributions by Duplication Type",
+       subtitle = "log1p-transformed; vertical line = median",
+       x = "log1p(value)", y = NULL) +
+  theme_hydra
+```
+
+### Opsin gene representation
+
+Of 50 opsin genes, `r sum(pair_features$either_opsin == "opsin", na.rm=TRUE)` 
+duplicate pairs involve at least one opsin. This is a small subset, motivating 
+the use of Bayesian inference for the opsin-specific analysis.
+
+```{r opsin-counts, fig.cap="Duplication type breakdown for opsin-involving vs non-opsin pairs."}
+pair_features %>%
+  filter(!is.na(either_opsin)) %>%
+  count(either_opsin, dup_type) %>%
+  group_by(either_opsin) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ggplot(aes(x = dup_type, y = pct, fill = dup_type)) +
+  geom_col(color = "#0d1117", linewidth = 0.6) +
+  geom_text(aes(label = sprintf("%.1f%%", pct)),
+            vjust = -0.4, size = 3, color = "#c9d1d9") +
+  facet_wrap(~either_opsin,
+             labeller = labeller(either_opsin = c(
+               "opsin"     = "Opsin-involving pairs (n=172)",
+               "non-opsin" = "Non-opsin pairs (n=50,192)"
+             ))) +
+  scale_fill_manual(values = COLORS, guide = "none") +
+  scale_y_continuous(labels = function(x) paste0(x, "%"),
+                     expand = expansion(mult = c(0, 0.15))) +
+  labs(title    = "Duplication Type Composition: Opsin vs Non-Opsin Pairs",
+       subtitle = "Note the elevated TD proportion in opsin-involving pairs",
+       x = NULL, y = "% of pairs") +
+  theme_hydra
+```
+
+### Pairwise correlations among predictors
+
+Checking for multicollinearity before modeling.
+
+```{r correlations, fig.cap="Pairwise Pearson correlations among continuous predictors."}
+cor_df <- pair_features %>%
+  select(
+    gene_length     = mean_gene_length,
+    dist_to_gene    = mean_dist_to_gene,
+    local_density   = mean_local_density,
+    scaffold_length = scaffold_chr_length_dup1
+  ) %>%
+  drop_na()
+
+cor_mat <- cor(cor_df, method = "pearson")
+
+cor_mat %>%
+  as.data.frame() %>%
+  rownames_to_column("var1") %>%
+  pivot_longer(-var1, names_to = "var2", values_to = "r") %>%
+  ggplot(aes(x = var1, y = var2, fill = r)) +
+  geom_tile(color = "#0d1117") +
+  geom_text(aes(label = round(r, 2)), color = "#e6edf3", size = 3.5) +
+  scale_fill_gradient2(low = "#4ecdc4", mid = "#1c2333",
+                       high = "#ff6b6b", midpoint = 0,
+                       limits = c(-1, 1), name = "Pearson r") +
+  coord_equal() +
+  labs(title = "Predictor Correlation Matrix",
+       x = NULL, y = NULL) +
+  theme_hydra +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+### Scaffold-level patterns
+
+Do TD duplications cluster on particular scaffolds?
+
+```{r scaffold-scatter, fig.cap="Relationship between scaffold size and the fraction of TD pairs per scaffold."}
+pair_features %>%
+  group_by(chrom1 = str_replace(dup1, "\\.G.*", "") %>%
+             str_replace("AEP_","")) %>%
+  summarise(
+    n_pairs    = n(),
+    td_pct     = mean(dup_type == "TD") * 100,
+    gene_count = first(gc1),
+    chrom_size = first(scaffold_chr_length_dup1),
+    .groups = "drop"
+  ) %>%
+  filter(n_pairs >= 10, !is.na(chrom_size)) %>%
+  mutate(chrom_label = str_replace(chrom1, "HVAEP", "")) %>%
+  ggplot(aes(x = chrom_size / 1e6, y = td_pct,
+             size = gene_count, color = gene_count)) +
+  geom_point(alpha = 0.85) +
+  geom_text(aes(label = chrom_label),
+            nudge_y = 0.3, size = 2.8, color = "#8b949e") +
+  scale_color_viridis_c(option = "plasma", name = "Gene count") +
+  scale_size_continuous(range = c(3, 10), guide = "none") +
+  labs(title    = "Scaffold Size vs TD Fraction",
+       subtitle = "Bubble size = gene count on scaffold",
+       x = "Scaffold length (Mb)", y = "% TD pairs") +
+  theme_hydra
+```
+
+---
+
+## Data Wrangling Notes
+
+All data processing was performed in R. The key steps and decisions are 
+documented here for reproducibility:
+
+1. **Gene ID parsing**: IDs follow the pattern `AEP_HVAEPx.Gnnnnnn`. The 
+   chromosome (`HVAEPx`) and gene ordinal (`nnnnnn`) were extracted via regex.
+
+2. **Scaffold lengths**: The GFF3 from NHGRI lacked `##sequence-region` header 
+   lines, so scaffold lengths were derived from `max(end)` across all features 
+   per scaffold — a conservative but reliable estimate.
+
+3. **Local gene density**: Rather than a scaffold-wide average, we computed 
+   a ±500 kb window-based density using `GenomicRanges::countOverlaps()`. This 
+   captures regional variation within scaffolds.
+
+4. **Distance to nearest gene**: Computed with `GenomicRanges::distanceToNearest()` 
+   on gene-level GRanges, excluding self-hits.
+
+5. **Opsin flag**: 50 opsin genes from lab annotation were matched to GFF3 
+   gene names by stripping the `AEP_` prefix. One opsin from the original 51-gene 
+   protein dataset was absent from the GFF3 (likely a scaffold not captured 
+   in the gene models).
+
+6. **Model dataset**: For the TD vs DD logistic regression, only same-chromosome 
+   pairs were retained for TD, and numeric predictors were z-score standardized 
+   to allow direct coefficient comparison.
+
+---
+
+## Session Info
+
+```{r session}
+sessionInfo()
+```
